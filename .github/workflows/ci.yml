@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup update stable && rustup default stable
       - run: cargo check
 
   fmt:
@@ -23,9 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - run: rustup update stable && rustup default stable
+      - run: rustup component add rustfmt
       - run: cargo fmt --check
 
   clippy:
@@ -33,9 +32,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - run: rustup update stable && rustup default stable
+      - run: rustup component add clippy
       - run: cargo clippy -- -D warnings
 
   test:
@@ -43,5 +41,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup update stable && rustup default stable
       - run: cargo test

@@ -437,6 +437,7 @@ dependencies = [
 name = "nano-banana-cli"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "serde",
  "serde_json",
