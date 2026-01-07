@@ -1,0 +1,8 @@
+[package]
+name = "nano-banana-cli"
+version = "0.1.0"
+edition = "2024"
+description = "CLI for interacting with Google Gemini Nano Banana Pro"
+license = "MIT"
+
+[dependencies]
