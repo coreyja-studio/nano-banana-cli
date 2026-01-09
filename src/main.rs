@@ -3,17 +3,21 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 
 const TEXT_MODEL: &str = "gemini-2.0-flash";
 const IMAGE_MODEL: &str = "gemini-2.0-flash-exp-image-generation";
+
+/// Secret name in mnemon/1Password for Google AI Studio credentials
+const MNEMON_SECRET_NAME: &str = "google-ai-studio";
 
 #[derive(Parser)]
 #[command(name = "nano-banana-cli")]
 #[command(about = "CLI for Google Gemini text and image generation")]
 struct Cli {
-    /// API key (defaults to GOOGLE_AI_STUDIO_API_KEY env var)
+    /// API key (defaults to GOOGLE_AI_STUDIO_API_KEY env var, then mnemon secrets)
     #[arg(long, env = "GOOGLE_AI_STUDIO_API_KEY")]
-    api_key: String,
+    api_key: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -95,12 +99,44 @@ struct InlineData {
     data: String,
 }
 
+/// Fetch the API key from mnemon secrets manager.
+///
+/// Expects a secret named `google-ai-studio` with a `secret` field containing the API key.
+fn api_key_from_mnemon() -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("mnemon")
+        .args(["secrets", "get", MNEMON_SECRET_NAME, "--field", "secret"])
+        .output()
+        .map_err(|e| format!("Failed to run mnemon: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "mnemon secrets failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Resolve the API key from CLI arg, env var, or mnemon secrets (in that order).
+fn resolve_api_key(cli_api_key: Option<String>) -> Result<String, Box<dyn std::error::Error>> {
+    // CLI arg or env var already handled by clap
+    if let Some(key) = cli_api_key {
+        return Ok(key);
+    }
+
+    // Fall back to mnemon secrets
+    api_key_from_mnemon()
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let api_key = resolve_api_key(cli.api_key)?;
 
     match cli.command {
-        Commands::Text { prompt } => generate_text(&cli.api_key, &prompt)?,
-        Commands::Image { prompt, output } => generate_image(&cli.api_key, &prompt, &output)?,
+        Commands::Text { prompt } => generate_text(&api_key, &prompt)?,
+        Commands::Image { prompt, output } => generate_image(&api_key, &prompt, &output)?,
     }
 
     Ok(())
