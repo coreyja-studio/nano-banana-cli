@@ -101,10 +101,10 @@ struct InlineData {
 
 /// Fetch the API key from mnemon secrets manager.
 ///
-/// Expects a secret named `google-ai-studio` with a `secret` field containing the API key.
+/// Expects a secret named `google-ai-studio` containing the API key.
 fn api_key_from_mnemon() -> Result<String, Box<dyn std::error::Error>> {
     let output = Command::new("mnemon")
-        .args(["secrets", "get", MNEMON_SECRET_NAME, "--field", "secret"])
+        .args(["secrets", "get", MNEMON_SECRET_NAME])
         .output()
         .map_err(|e| format!("Failed to run mnemon: {}", e))?;
 
