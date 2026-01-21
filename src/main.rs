@@ -8,14 +8,14 @@ use std::process::Command;
 const TEXT_MODEL: &str = "gemini-2.0-flash";
 const IMAGE_MODEL: &str = "gemini-2.0-flash-exp-image-generation";
 
-/// Secret name in mnemon/1Password for Google AI Studio credentials
-const MNEMON_SECRET_NAME: &str = "google-ai-studio";
+/// Secret name in mull/1Password for Google AI Studio credentials
+const MULL_SECRET_NAME: &str = "google-ai-studio";
 
 #[derive(Parser)]
 #[command(name = "nano-banana-cli")]
 #[command(about = "CLI for Google Gemini text and image generation")]
 struct Cli {
-    /// API key (defaults to GOOGLE_AI_STUDIO_API_KEY env var, then mnemon secrets)
+    /// API key (defaults to GOOGLE_AI_STUDIO_API_KEY env var, then mull secrets)
     #[arg(long, env = "GOOGLE_AI_STUDIO_API_KEY")]
     api_key: Option<String>,
 
@@ -99,18 +99,18 @@ struct InlineData {
     data: String,
 }
 
-/// Fetch the API key from mnemon secrets manager.
+/// Fetch the API key from mull secrets manager.
 ///
 /// Expects a secret named `google-ai-studio` containing the API key.
-fn api_key_from_mnemon() -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("mnemon")
-        .args(["secrets", "get", MNEMON_SECRET_NAME])
+fn api_key_from_mull() -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("mull")
+        .args(["secrets", "get", MULL_SECRET_NAME])
         .output()
-        .map_err(|e| format!("Failed to run mnemon: {}", e))?;
+        .map_err(|e| format!("Failed to run mull: {}", e))?;
 
     if !output.status.success() {
         return Err(format!(
-            "mnemon secrets failed: {}",
+            "mull secrets failed: {}",
             String::from_utf8_lossy(&output.stderr)
         )
         .into());
@@ -119,15 +119,15 @@ fn api_key_from_mnemon() -> Result<String, Box<dyn std::error::Error>> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Resolve the API key from CLI arg, env var, or mnemon secrets (in that order).
+/// Resolve the API key from CLI arg, env var, or mull secrets (in that order).
 fn resolve_api_key(cli_api_key: Option<String>) -> Result<String, Box<dyn std::error::Error>> {
     // CLI arg or env var already handled by clap
     if let Some(key) = cli_api_key {
         return Ok(key);
     }
 
-    // Fall back to mnemon secrets
-    api_key_from_mnemon()
+    // Fall back to mull secrets
+    api_key_from_mull()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
