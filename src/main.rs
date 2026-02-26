@@ -157,7 +157,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Text { prompt } => generate_text(&api_key, &prompt)?,
-        Commands::Image { prompt, output, model } => generate_image(&api_key, &prompt, &output, &model)?,
+        Commands::Image {
+            prompt,
+            output,
+            model,
+        } => generate_image(&api_key, &prompt, &output, &model)?,
     }
 
     Ok(())
