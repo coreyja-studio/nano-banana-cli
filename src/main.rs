@@ -6,7 +6,24 @@ use std::path::PathBuf;
 use std::process::Command;
 
 const TEXT_MODEL: &str = "gemini-2.0-flash";
-const IMAGE_MODEL: &str = "gemini-2.0-flash-exp-image-generation";
+
+#[derive(clap::ValueEnum, Clone, Debug, Default)]
+enum ImageModel {
+    /// Nano Banana 2 - gemini-3.1-flash-image (default)
+    #[default]
+    NanoBanana2,
+    /// Nano Banana 1 - gemini-2.0-flash-exp-image-generation (legacy)
+    NanoBanana1,
+}
+
+impl ImageModel {
+    fn api_name(&self) -> &'static str {
+        match self {
+            ImageModel::NanoBanana2 => "gemini-3.1-flash-image",
+            ImageModel::NanoBanana1 => "gemini-2.0-flash-exp-image-generation",
+        }
+    }
+}
 
 /// Secret name in mull/1Password for Google AI Studio credentials
 const MULL_SECRET_NAME: &str = "google-ai-studio";
@@ -30,7 +47,7 @@ enum Commands {
         /// The prompt to send to the model
         prompt: String,
     },
-    /// Generate an image using Nano Banana Pro
+    /// Generate an image using Nano Banana
     Image {
         /// The prompt describing the image to generate
         prompt: String,
@@ -38,6 +55,10 @@ enum Commands {
         /// Output file path (defaults to output.png)
         #[arg(short, long, default_value = "output.png")]
         output: PathBuf,
+
+        /// Image model to use (default: nano-banana-2)
+        #[arg(long, default_value = "nano-banana-2")]
+        model: ImageModel,
     },
 }
 
@@ -136,7 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Text { prompt } => generate_text(&api_key, &prompt)?,
-        Commands::Image { prompt, output } => generate_image(&api_key, &prompt, &output)?,
+        Commands::Image { prompt, output, model } => generate_image(&api_key, &prompt, &output, &model)?,
     }
 
     Ok(())
@@ -176,10 +197,12 @@ fn generate_image(
     api_key: &str,
     prompt: &str,
     output: &PathBuf,
+    model: &ImageModel,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        IMAGE_MODEL, api_key
+        model.api_name(),
+        api_key
     );
 
     let request = ImageRequest {
@@ -296,5 +319,14 @@ mod tests {
             .unwrap();
         assert_eq!(inline_data.mime_type, "image/png");
         assert_eq!(inline_data.data, "iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn test_image_model_api_names() {
+        assert_eq!(ImageModel::NanoBanana2.api_name(), "gemini-3.1-flash-image");
+        assert_eq!(
+            ImageModel::NanoBanana1.api_name(),
+            "gemini-2.0-flash-exp-image-generation"
+        );
     }
 }
