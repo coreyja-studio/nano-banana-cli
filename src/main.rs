@@ -9,7 +9,7 @@ const TEXT_MODEL: &str = "gemini-2.0-flash";
 
 #[derive(clap::ValueEnum, Clone, Debug, Default)]
 enum ImageModel {
-    /// Nano Banana 2 - gemini-3.1-flash-image (default)
+    /// Nano Banana 2 - gemini-3.1-flash-image-preview (default)
     #[default]
     NanoBanana2,
     /// Nano Banana 1 - gemini-2.0-flash-exp-image-generation (legacy)
@@ -19,7 +19,7 @@ enum ImageModel {
 impl ImageModel {
     fn api_name(&self) -> &'static str {
         match self {
-            ImageModel::NanoBanana2 => "gemini-3.1-flash-image",
+            ImageModel::NanoBanana2 => "gemini-3.1-flash-image-preview",
             ImageModel::NanoBanana1 => "gemini-2.0-flash-exp-image-generation",
         }
     }
