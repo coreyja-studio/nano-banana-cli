@@ -327,7 +327,10 @@ mod tests {
 
     #[test]
     fn test_image_model_api_names() {
-        assert_eq!(ImageModel::NanoBanana2.api_name(), "gemini-3.1-flash-image-preview");
+        assert_eq!(
+            ImageModel::NanoBanana2.api_name(),
+            "gemini-3.1-flash-image-preview"
+        );
         assert_eq!(
             ImageModel::NanoBanana1.api_name(),
             "gemini-2.0-flash-exp-image-generation"
