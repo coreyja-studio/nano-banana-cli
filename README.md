@@ -6,7 +6,7 @@ CLI for text generation with Google Gemini, and image generation with Google Gem
 
 ## Features
 
-- Text generation using Gemini 2.0 Flash
+- Text generation using Gemini 3.6 Flash
 - Image generation across multiple models and providers (Google Gemini and OpenAI)
 
 ## Installation
