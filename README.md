@@ -2,12 +2,12 @@
 
 # nano-banana-cli
 
-CLI for text and image generation with Google Gemini and OpenAI.
+CLI for text generation with Google Gemini, and image generation with Google Gemini or OpenAI.
 
 ## Features
 
 - Text generation using Gemini 2.0 Flash
-- Image generation across multiple models and providers
+- Image generation across multiple models and providers (Google Gemini and OpenAI)
 
 ## Installation
 

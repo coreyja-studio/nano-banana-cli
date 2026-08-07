@@ -80,7 +80,7 @@ const OPENAI_MULL_SECRET_NAME: &str = "openai";
 
 #[derive(Parser)]
 #[command(name = "nano-banana-cli")]
-#[command(about = "CLI for Google Gemini and OpenAI text and image generation")]
+#[command(about = "CLI for Google Gemini text generation and Google/OpenAI image generation")]
 struct Cli {
     /// Google API key (defaults to GOOGLE_AI_STUDIO_API_KEY env var, then mull secrets)
     #[arg(long, env = "GOOGLE_AI_STUDIO_API_KEY")]
@@ -336,76 +336,86 @@ impl ImageProvider for OpenAIImageProvider {
     }
 }
 
-/// Fetch the API key from mull secrets manager.
+/// Normalize a candidate key, treating a blank value as absent.
 ///
-/// Expects a secret named `google-ai-studio` containing the API key.
-fn api_key_from_mull() -> Result<String, Box<dyn std::error::Error>> {
+/// clap reports a set-but-empty env var as `Some("")`, which is a common CI and
+/// shell-profile state (`export OPENAI_API_KEY=`, or a workflow interpolating a
+/// secret that isn't set). Such a user has no usable key, so blank must fall
+/// through to the next tier rather than being sent as `Authorization: Bearer `
+/// and coming back as an opaque 401.
+fn non_blank_key(key: String) -> Option<String> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Fetch a named secret from the mull secrets manager.
+///
+/// Shared by both providers so that fixes here (such as the blank-value guard)
+/// can't apply to one credential path and be forgotten in the other.
+fn api_key_from_mull(secret_name: &str) -> Result<String, Box<dyn std::error::Error>> {
     let output = Command::new("mull")
-        .args(["secrets", "get", MULL_SECRET_NAME])
+        .args(["secrets", "get", secret_name])
         .output()
         .map_err(|e| format!("Failed to run mull: {}", e))?;
 
     if !output.status.success() {
         return Err(format!(
             "mull secrets failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stderr).trim()
         )
         .into());
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    non_blank_key(String::from_utf8_lossy(&output.stdout).into_owned())
+        .ok_or_else(|| format!("mull secret '{}' is empty", secret_name).into())
 }
 
-/// Resolve the API key from CLI arg, env var, or mull secrets (in that order).
+/// Resolve the Google API key from CLI arg, env var, or mull secrets (in that order).
 fn resolve_api_key(cli_api_key: Option<String>) -> Result<String, Box<dyn std::error::Error>> {
     // CLI arg or env var already handled by clap
-    if let Some(key) = cli_api_key {
+    if let Some(key) = cli_api_key.and_then(non_blank_key) {
         return Ok(key);
     }
 
     // Fall back to mull secrets
-    api_key_from_mull()
+    api_key_from_mull(MULL_SECRET_NAME)
 }
 
-/// Fetch the OpenAI API key from mull secrets manager.
+/// Build the actionable "no OpenAI key" error, naming every way to supply one.
 ///
-/// Expects a secret named `openai` containing the API key.
-fn openai_api_key_from_mull() -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("mull")
-        .args(["secrets", "get", OPENAI_MULL_SECRET_NAME])
-        .output()
-        .map_err(|e| format!("Failed to run mull: {}", e))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "mull secrets failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+/// `cause` is preserved rather than swallowed: mull can fail with the secret
+/// fully present (1Password locked, biometric prompt declined, `mull` not
+/// installed), and telling that user their key doesn't exist sends them to fix
+/// the wrong thing.
+/// The cause trails the guidance rather than interrupting it: mull's own error
+/// is a multi-line block, and leading with it pushes the actionable part out of
+/// sight.
+fn missing_openai_key_error(cause: &dyn std::fmt::Display) -> Box<dyn std::error::Error> {
+    format!(
+        "Could not resolve an OpenAI API key. Provide one via:\n\
+         \x20 1. --openai-api-key flag\n\
+         \x20 2. OPENAI_API_KEY environment variable\n\
+         \x20 3. mull secrets (1Password secret named 'openai')\n\
+         \n\
+         Lookup failed with: {cause}"
+    )
+    .into()
 }
 
 /// Resolve the OpenAI API key from CLI arg, env var, or mull secrets.
-///
-/// The mull failure is replaced with an actionable message: a raw
-/// "could not read secret" from 1Password doesn't tell the user what to do.
 fn resolve_openai_api_key(
     cli_api_key: Option<String>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     // CLI arg or env var already handled by clap
-    if let Some(key) = cli_api_key {
+    if let Some(key) = cli_api_key.and_then(non_blank_key) {
         return Ok(key);
     }
 
-    openai_api_key_from_mull().map_err(|_| {
-        "No OpenAI API key found. Provide one via:\n\
-         \x20 1. --openai-api-key flag\n\
-         \x20 2. OPENAI_API_KEY environment variable\n\
-         \x20 3. mull secrets (1Password secret named 'openai')"
-            .into()
-    })
+    api_key_from_mull(OPENAI_MULL_SECRET_NAME).map_err(|e| missing_openai_key_error(&e))
 }
 
 fn main() -> ExitCode {
@@ -481,6 +491,20 @@ fn generate_text(api_key: &str, prompt: &str) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+/// Cap an API error body so a gateway's HTML page can't flood the terminal.
+///
+/// The APIs' own error bodies are small JSON and pass through untouched.
+fn truncate_for_display(body: &str) -> String {
+    const MAX_CHARS: usize = 1000;
+
+    if body.chars().count() <= MAX_CHARS {
+        return body.to_string();
+    }
+
+    let head: String = body.chars().take(MAX_CHARS).collect();
+    format!("{}... (truncated)", head)
+}
+
 fn generate_image(
     google_api_key: Option<String>,
     openai_api_key: Option<String>,
@@ -500,9 +524,13 @@ fn generate_image(
                 aspect_ratio: aspect_ratio.clone(),
             }),
         ),
+        // Listed exhaustively rather than with a `_` arm: a future model added
+        // without a match arm should fail to compile, not silently route to
+        // Google and surface as an unexplained HTTP 400.
+        //
         // Quality and aspect ratio are intentionally ignored for Google models
         // rather than rejected, so the flags are safe to always pass.
-        _ => (
+        ImageModel::NanoBanana2 | ImageModel::NanoBanana1 | ImageModel::NanoBananaPro => (
             resolve_api_key(google_api_key)?,
             Box::new(GoogleImageProvider),
         ),
@@ -510,12 +538,38 @@ fn generate_image(
 
     let req = provider.build_request(&api_key, model.api_name(), prompt);
 
-    let mut http = ureq::post(&req.url);
+    // Both image APIs explain 4xx/5xx failures only in the response body
+    // (invalid key, unverified organization, moderation rejection, quota).
+    // ureq's default turns those into `Error::StatusCode(u16)`, which discards
+    // the body and prints a bare "http status: N", so status handling is taken
+    // over here — once, for every provider.
+    let agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+
+    let mut http = agent.post(&req.url);
     for (key, value) in &req.headers {
         http = http.header(key, value);
     }
 
-    let response_body: serde_json::Value = http.send_json(&req.body)?.body_mut().read_json()?;
+    let mut response = http.send_json(&req.body)?;
+    let status = response.status();
+
+    if !status.is_success() {
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .unwrap_or_else(|e| format!("<unreadable response body: {}>", e));
+        return Err(format!(
+            "Image API error (HTTP {}): {}",
+            status.as_u16(),
+            truncate_for_display(body.trim())
+        )
+        .into());
+    }
+
+    let response_body: serde_json::Value = response.body_mut().read_json()?;
 
     let image = provider.parse_response(response_body)?;
 
@@ -781,15 +835,13 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_key_missing_error() {
-        // Only meaningful when no 'openai' secret is configured — otherwise
-        // resolution legitimately succeeds.
-        if openai_api_key_from_mull().is_ok() {
-            eprintln!("Skipping test_openai_key_missing_error: OpenAI key is configured");
-            return;
-        }
+    fn test_openai_key_missing_error_names_every_source() {
+        // Asserts on the message directly rather than driving resolution: the
+        // real path shells out to mull/1Password, which makes the test
+        // non-hermetic and would silently stop covering this the moment the
+        // 'openai' secret is created.
+        let msg = missing_openai_key_error(&"mull is not installed").to_string();
 
-        let msg = resolve_openai_api_key(None).unwrap_err().to_string();
         assert!(
             msg.contains("--openai-api-key"),
             "error must mention the --openai-api-key flag: {msg}"
@@ -802,6 +854,80 @@ mod tests {
             msg.contains("openai"),
             "error must mention the mull secret name: {msg}"
         );
+    }
+
+    #[test]
+    fn test_openai_key_error_preserves_cause() {
+        // mull can fail with the secret present (1Password locked, biometric
+        // declined). The user needs to see which of the two it was.
+        let msg = missing_openai_key_error(&"1Password is locked").to_string();
+        assert!(
+            msg.contains("1Password is locked"),
+            "the underlying cause must survive into the message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_blank_cli_key_is_treated_as_absent() {
+        // clap hands over Some("") for `export OPENAI_API_KEY=`, which must not
+        // short-circuit resolution into sending `Authorization: Bearer `.
+        assert_eq!(non_blank_key(String::new()), None);
+        assert_eq!(non_blank_key("   \n".to_string()), None);
+        assert_eq!(
+            non_blank_key("  sk-abc123  ".to_string()),
+            Some("sk-abc123".to_string())
+        );
+    }
+
+    // The two tests below exercise the full resolution chain, which shells out
+    // to mull/1Password — non-hermetic and potentially blocking on a biometric
+    // prompt, so they're opt-in via `cargo test -- --ignored`. The blank-value
+    // logic itself is covered hermetically by the test above.
+
+    #[test]
+    #[ignore = "shells out to mull/1Password"]
+    fn test_blank_openai_key_does_not_resolve_successfully() {
+        // A blank key must fall through to the mull tier. Whether mull then
+        // succeeds depends on the machine, so this asserts only that the blank
+        // value itself was not accepted verbatim.
+        let resolved = resolve_openai_api_key(Some("   ".to_string()));
+        match resolved {
+            Ok(key) => assert!(
+                !key.trim().is_empty(),
+                "a blank key must never resolve to a blank key"
+            ),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("--openai-api-key"),
+                    "falling through must produce the guidance error: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "shells out to mull/1Password"]
+    fn test_blank_google_key_does_not_resolve_successfully() {
+        let resolved = resolve_api_key(Some(String::new()));
+        if let Ok(key) = resolved {
+            assert!(
+                !key.trim().is_empty(),
+                "a blank key must never resolve to a blank key"
+            );
+        }
+    }
+
+    #[test]
+    fn test_truncate_for_display() {
+        // Real API error bodies are small JSON and must pass through intact.
+        let short = r#"{"error":{"message":"Your organization must be verified"}}"#;
+        assert_eq!(truncate_for_display(short), short);
+
+        let long = "x".repeat(5000);
+        let truncated = truncate_for_display(&long);
+        assert!(truncated.ends_with("... (truncated)"));
+        assert!(truncated.len() < long.len());
     }
 
     #[test]
