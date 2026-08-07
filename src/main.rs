@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, ExitCode};
 
 const TEXT_MODEL: &str = "gemini-2.0-flash";
 
@@ -16,6 +16,11 @@ enum ImageModel {
     NanoBanana1,
     /// Nano Banana Pro - gemini-3-pro-image
     NanoBananaPro,
+    /// GPT Image 2 - OpenAI's image model (best for text rendered in images)
+    // heck's kebab-case does not insert a hyphen before a trailing digit
+    // (`GptImage2` would become `gpt-image2`), so the name is spelled out.
+    #[value(name = "gpt-image-2")]
+    GptImage2,
 }
 
 impl ImageModel {
@@ -24,28 +29,66 @@ impl ImageModel {
             ImageModel::NanoBanana2 => "gemini-3.1-flash-image-preview",
             ImageModel::NanoBanana1 => "gemini-2.0-flash-exp-image-generation",
             ImageModel::NanoBananaPro => "gemini-3-pro-image",
+            ImageModel::GptImage2 => "gpt-image-2",
         }
     }
+}
 
-    /// The backend that knows how to build requests and parse responses
-    /// for this model.
-    fn provider(&self) -> Box<dyn ImageProvider> {
-        // All current models are served by Google; adding a second provider
-        // only requires a new arm here, not changes to GoogleImageProvider.
-        Box::new(GoogleImageProvider)
+/// Image quality tier. Consumed by OpenAI models only; Google models ignore it.
+#[derive(clap::ValueEnum, Clone, Debug, Default, PartialEq, Eq)]
+enum Quality {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl Quality {
+    fn api_value(&self) -> &'static str {
+        match self {
+            Quality::Low => "low",
+            Quality::Medium => "medium",
+            Quality::High => "high",
+        }
+    }
+}
+
+/// Output aspect ratio. Consumed by OpenAI models only; Google models ignore it.
+#[derive(clap::ValueEnum, Clone, Debug, Default, PartialEq, Eq)]
+enum AspectRatio {
+    #[default]
+    Square,
+    Portrait,
+    Landscape,
+}
+
+impl AspectRatio {
+    fn size_string(&self) -> &'static str {
+        match self {
+            AspectRatio::Square => "1024x1024",
+            AspectRatio::Portrait => "1024x1536",
+            AspectRatio::Landscape => "1536x1024",
+        }
     }
 }
 
 /// Secret name in mull/1Password for Google AI Studio credentials
 const MULL_SECRET_NAME: &str = "google-ai-studio";
 
+/// Secret name in mull/1Password for OpenAI credentials
+const OPENAI_MULL_SECRET_NAME: &str = "openai";
+
 #[derive(Parser)]
 #[command(name = "nano-banana-cli")]
-#[command(about = "CLI for Google Gemini text and image generation")]
+#[command(about = "CLI for Google Gemini and OpenAI text and image generation")]
 struct Cli {
-    /// API key (defaults to GOOGLE_AI_STUDIO_API_KEY env var, then mull secrets)
+    /// Google API key (defaults to GOOGLE_AI_STUDIO_API_KEY env var, then mull secrets)
     #[arg(long, env = "GOOGLE_AI_STUDIO_API_KEY")]
     api_key: Option<String>,
+
+    /// OpenAI API key (defaults to OPENAI_API_KEY env var, then mull secrets)
+    #[arg(long, env = "OPENAI_API_KEY")]
+    openai_api_key: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -58,7 +101,7 @@ enum Commands {
         /// The prompt to send to the model
         prompt: String,
     },
-    /// Generate an image using Nano Banana
+    /// Generate an image
     Image {
         /// The prompt describing the image to generate
         prompt: String,
@@ -70,6 +113,14 @@ enum Commands {
         /// Image model to use (default: nano-banana2)
         #[arg(long, default_value = "nano-banana2")]
         model: ImageModel,
+
+        /// Image quality tier - OpenAI models only (default: medium)
+        #[arg(long, default_value = "medium")]
+        quality: Quality,
+
+        /// Aspect ratio - OpenAI models only (default: square)
+        #[arg(long, default_value = "square")]
+        aspect_ratio: AspectRatio,
     },
 }
 
@@ -131,6 +182,26 @@ struct InlineData {
     data: String,
 }
 
+#[derive(Serialize)]
+struct OpenAIImageRequest {
+    model: String,
+    prompt: String,
+    size: String,
+    quality: String,
+}
+
+/// OpenAI's images/generations response. `created` and `usage` are also
+/// returned by the API but aren't needed here, so serde ignores them.
+#[derive(Deserialize)]
+struct OpenAIImageResponse {
+    data: Vec<OpenAIImageData>,
+}
+
+#[derive(Deserialize)]
+struct OpenAIImageData {
+    b64_json: String,
+}
+
 /// A provider-built request, ready to be sent over HTTP.
 ///
 /// `headers` must not contain `Content-Type` — the generic HTTP layer uses
@@ -151,8 +222,8 @@ struct GeneratedImage {
 ///
 /// Each provider knows how to build an HTTP request (URL, headers, body) and
 /// parse the response into image data for its specific API shape. Adding a new
-/// provider requires implementing this trait and wiring it into
-/// `ImageModel::provider()` — no existing provider code changes.
+/// provider requires implementing this trait and wiring it into the match in
+/// `generate_image` — no existing provider code changes.
 trait ImageProvider {
     /// Build the full request for a text-to-image generation call.
     fn build_request(&self, api_key: &str, model_api_name: &str, prompt: &str) -> ProviderRequest;
@@ -216,6 +287,55 @@ impl ImageProvider for GoogleImageProvider {
     }
 }
 
+/// OpenAI GPT Image 2 provider.
+///
+/// Quality and aspect ratio live here rather than on `build_request` because
+/// the trait signature is shared with providers that have no such options.
+struct OpenAIImageProvider {
+    quality: Quality,
+    aspect_ratio: AspectRatio,
+}
+
+impl ImageProvider for OpenAIImageProvider {
+    fn build_request(&self, api_key: &str, model_api_name: &str, prompt: &str) -> ProviderRequest {
+        let request = OpenAIImageRequest {
+            model: model_api_name.to_string(),
+            prompt: prompt.to_string(),
+            size: self.aspect_ratio.size_string().to_string(),
+            quality: self.quality.api_value().to_string(),
+        };
+
+        ProviderRequest {
+            url: "https://api.openai.com/v1/images/generations".to_string(),
+            headers: vec![("Authorization".to_string(), format!("Bearer {}", api_key))],
+            body: serde_json::to_value(&request)
+                .expect("OpenAIImageRequest is always serializable"),
+        }
+    }
+
+    fn parse_response(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<GeneratedImage, Box<dyn std::error::Error>> {
+        let response: OpenAIImageResponse = serde_json::from_value(body)?;
+
+        let image_data = response
+            .data
+            .first()
+            .ok_or("OpenAI response contained no image data")?;
+
+        // Trim before decoding — API responses can pick up stray whitespace.
+        let data = BASE64_STANDARD.decode(image_data.b64_json.trim())?;
+
+        Ok(GeneratedImage {
+            // GPT Image 2 returns PNG unless another output format is requested,
+            // and this CLI never requests one.
+            mime_type: "image/png".to_string(),
+            data,
+        })
+    }
+}
+
 /// Fetch the API key from mull secrets manager.
 ///
 /// Expects a secret named `google-ai-studio` containing the API key.
@@ -247,17 +367,84 @@ fn resolve_api_key(cli_api_key: Option<String>) -> Result<String, Box<dyn std::e
     api_key_from_mull()
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Fetch the OpenAI API key from mull secrets manager.
+///
+/// Expects a secret named `openai` containing the API key.
+fn openai_api_key_from_mull() -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("mull")
+        .args(["secrets", "get", OPENAI_MULL_SECRET_NAME])
+        .output()
+        .map_err(|e| format!("Failed to run mull: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "mull secrets failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Resolve the OpenAI API key from CLI arg, env var, or mull secrets.
+///
+/// The mull failure is replaced with an actionable message: a raw
+/// "could not read secret" from 1Password doesn't tell the user what to do.
+fn resolve_openai_api_key(
+    cli_api_key: Option<String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // CLI arg or env var already handled by clap
+    if let Some(key) = cli_api_key {
+        return Ok(key);
+    }
+
+    openai_api_key_from_mull().map_err(|_| {
+        "No OpenAI API key found. Provide one via:\n\
+         \x20 1. --openai-api-key flag\n\
+         \x20 2. OPENAI_API_KEY environment variable\n\
+         \x20 3. mull secrets (1Password secret named 'openai')"
+            .into()
+    })
+}
+
+fn main() -> ExitCode {
+    // Returning Result from main would print the error via Debug, which escapes
+    // newlines — the multi-line credential help would arrive as literal "\n".
+    if let Err(e) = run() {
+        eprintln!("Error: {}", e);
+        return ExitCode::FAILURE;
+    }
+
+    ExitCode::SUCCESS
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let api_key = resolve_api_key(cli.api_key)?;
 
     match cli.command {
-        Commands::Text { prompt } => generate_text(&api_key, &prompt)?,
+        // Text is Google-only, so its key can be resolved eagerly.
+        Commands::Text { prompt } => {
+            let api_key = resolve_api_key(cli.api_key)?;
+            generate_text(&api_key, &prompt)?;
+        }
+        // Image defers both keys to generate_image: picking a Google model must
+        // not require an OpenAI key to be configured, and vice versa.
         Commands::Image {
             prompt,
             output,
             model,
-        } => generate_image(&api_key, &prompt, &output, &model)?,
+            quality,
+            aspect_ratio,
+        } => generate_image(
+            cli.api_key,
+            cli.openai_api_key,
+            &prompt,
+            &output,
+            &model,
+            &quality,
+            &aspect_ratio,
+        )?,
     }
 
     Ok(())
@@ -295,13 +482,33 @@ fn generate_text(api_key: &str, prompt: &str) -> Result<(), Box<dyn std::error::
 }
 
 fn generate_image(
-    api_key: &str,
+    google_api_key: Option<String>,
+    openai_api_key: Option<String>,
     prompt: &str,
     output: &PathBuf,
     model: &ImageModel,
+    quality: &Quality,
+    aspect_ratio: &AspectRatio,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let provider = model.provider();
-    let req = provider.build_request(api_key, model.api_name(), prompt);
+    // Credentials resolve inside the arm for the selected provider, so an
+    // unused provider's missing key never blocks a run.
+    let (api_key, provider): (String, Box<dyn ImageProvider>) = match model {
+        ImageModel::GptImage2 => (
+            resolve_openai_api_key(openai_api_key)?,
+            Box::new(OpenAIImageProvider {
+                quality: quality.clone(),
+                aspect_ratio: aspect_ratio.clone(),
+            }),
+        ),
+        // Quality and aspect ratio are intentionally ignored for Google models
+        // rather than rejected, so the flags are safe to always pass.
+        _ => (
+            resolve_api_key(google_api_key)?,
+            Box::new(GoogleImageProvider),
+        ),
+    };
+
+    let req = provider.build_request(&api_key, model.api_name(), prompt);
 
     let mut http = ureq::post(&req.url);
     for (key, value) in &req.headers {
@@ -322,6 +529,7 @@ fn generate_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::ValueEnum;
 
     #[test]
     fn test_text_request_serialization() {
@@ -414,6 +622,186 @@ mod tests {
             "gemini-2.0-flash-exp-image-generation"
         );
         assert_eq!(ImageModel::NanoBananaPro.api_name(), "gemini-3-pro-image");
+        assert_eq!(ImageModel::GptImage2.api_name(), "gpt-image-2");
+    }
+
+    #[test]
+    fn test_gpt_image_2_clap_value_name() {
+        // heck would kebab-case this to "gpt-image2"; the explicit
+        // #[value(name = ...)] is what keeps the hyphen before the digit.
+        let name = ImageModel::GptImage2
+            .to_possible_value()
+            .unwrap()
+            .get_name()
+            .to_string();
+        assert_eq!(name, "gpt-image-2");
+    }
+
+    #[test]
+    fn test_cli_gpt_image_2_parses() {
+        let cli = Cli::try_parse_from([
+            "nano-banana-cli",
+            "image",
+            "a prompt",
+            "--model",
+            "gpt-image-2",
+        ]);
+        assert!(
+            cli.is_ok(),
+            "--model gpt-image-2 should parse: {:?}",
+            cli.err()
+        );
+    }
+
+    #[test]
+    fn test_quality_default_and_values() {
+        assert_eq!(Quality::default(), Quality::Medium);
+        assert_eq!(Quality::Low.api_value(), "low");
+        assert_eq!(Quality::Medium.api_value(), "medium");
+        assert_eq!(Quality::High.api_value(), "high");
+    }
+
+    #[test]
+    fn test_aspect_ratio_default_and_sizes() {
+        assert_eq!(AspectRatio::default(), AspectRatio::Square);
+        assert_eq!(AspectRatio::Square.size_string(), "1024x1024");
+        assert_eq!(AspectRatio::Portrait.size_string(), "1024x1536");
+        assert_eq!(AspectRatio::Landscape.size_string(), "1536x1024");
+    }
+
+    #[test]
+    fn test_openai_request_serialization() {
+        let request = OpenAIImageRequest {
+            model: "gpt-image-2".to_string(),
+            prompt: "A cat holding a sign that says HELLO".to_string(),
+            size: "1024x1024".to_string(),
+            quality: "medium".to_string(),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("gpt-image-2"));
+        assert!(json.contains("A cat holding a sign that says HELLO"));
+        assert!(json.contains("1024x1024"));
+        assert!(json.contains("medium"));
+    }
+
+    #[test]
+    fn test_openai_response_deserialization() {
+        let json = r#"{"created": 1234567890, "data": [{"b64_json": "iVBORw0KGgo="}]}"#;
+
+        let response: OpenAIImageResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(response.data[0].b64_json, "iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn test_openai_response_with_usage() {
+        // The real API also returns `usage`; parsing must not choke on it.
+        let json = r#"{
+            "created": 1234567890,
+            "data": [{"b64_json": "iVBORw0KGgo="}],
+            "usage": {"total_tokens": 1234, "input_tokens": 10, "output_tokens": 1224}
+        }"#;
+
+        let response: OpenAIImageResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.data[0].b64_json, "iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn test_openai_provider_build_request() {
+        let provider = OpenAIImageProvider {
+            quality: Quality::Medium,
+            aspect_ratio: AspectRatio::Square,
+        };
+        let req = provider.build_request("test-key", "gpt-image-2", "A cat");
+
+        assert_eq!(req.url, "https://api.openai.com/v1/images/generations");
+        assert_eq!(req.body["model"].as_str(), Some("gpt-image-2"));
+        assert_eq!(req.body["prompt"].as_str(), Some("A cat"));
+        assert_eq!(req.body["size"].as_str(), Some("1024x1024"));
+        assert_eq!(req.body["quality"].as_str(), Some("medium"));
+
+        let auth = req
+            .headers
+            .iter()
+            .find(|(k, _)| k == "Authorization")
+            .expect("Authorization header missing from provider request");
+        assert_eq!(auth.1, "Bearer test-key");
+
+        // send_json sets Content-Type; a duplicate here would conflict.
+        assert!(req.headers.iter().all(|(k, _)| k != "Content-Type"));
+        assert!(!req.url.contains("test-key"));
+    }
+
+    #[test]
+    fn test_openai_provider_options_reach_request_body() {
+        let provider = OpenAIImageProvider {
+            quality: Quality::High,
+            aspect_ratio: AspectRatio::Landscape,
+        };
+        let req = provider.build_request("k", "gpt-image-2", "a dog");
+
+        assert_eq!(req.body["quality"].as_str(), Some("high"));
+        assert_eq!(req.body["size"].as_str(), Some("1536x1024"));
+    }
+
+    #[test]
+    fn test_openai_provider_parse_response() {
+        let provider = OpenAIImageProvider {
+            quality: Quality::Medium,
+            aspect_ratio: AspectRatio::Square,
+        };
+        let body = serde_json::json!({
+            "created": 1234567890,
+            "data": [{"b64_json": "iVBORw0KGgo="}]
+        });
+
+        let image = provider.parse_response(body).expect("should parse");
+        assert_eq!(image.mime_type, "image/png");
+        assert!(!image.data.is_empty());
+    }
+
+    #[test]
+    fn test_openai_provider_parse_response_empty_data() {
+        let provider = OpenAIImageProvider {
+            quality: Quality::Medium,
+            aspect_ratio: AspectRatio::Square,
+        };
+        let body = serde_json::json!({"created": 123, "data": []});
+
+        // `let else` rather than unwrap_err: GeneratedImage holds raw image
+        // bytes and deliberately doesn't derive Debug.
+        let Err(err) = provider.parse_response(body) else {
+            panic!("an empty data array must not parse as a successful image");
+        };
+        assert!(
+            err.to_string().contains("no image data"),
+            "empty data should produce a specific error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_openai_key_missing_error() {
+        // Only meaningful when no 'openai' secret is configured — otherwise
+        // resolution legitimately succeeds.
+        if openai_api_key_from_mull().is_ok() {
+            eprintln!("Skipping test_openai_key_missing_error: OpenAI key is configured");
+            return;
+        }
+
+        let msg = resolve_openai_api_key(None).unwrap_err().to_string();
+        assert!(
+            msg.contains("--openai-api-key"),
+            "error must mention the --openai-api-key flag: {msg}"
+        );
+        assert!(
+            msg.contains("OPENAI_API_KEY"),
+            "error must mention the OPENAI_API_KEY env var: {msg}"
+        );
+        assert!(
+            msg.contains("openai"),
+            "error must mention the mull secret name: {msg}"
+        );
     }
 
     #[test]
