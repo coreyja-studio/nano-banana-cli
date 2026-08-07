@@ -14,6 +14,8 @@ enum ImageModel {
     NanoBanana2,
     /// Nano Banana 1 - gemini-2.0-flash-exp-image-generation (legacy)
     NanoBanana1,
+    /// Nano Banana Pro - gemini-3-pro-image
+    NanoBananaPro,
 }
 
 impl ImageModel {
@@ -21,7 +23,16 @@ impl ImageModel {
         match self {
             ImageModel::NanoBanana2 => "gemini-3.1-flash-image-preview",
             ImageModel::NanoBanana1 => "gemini-2.0-flash-exp-image-generation",
+            ImageModel::NanoBananaPro => "gemini-3-pro-image",
         }
+    }
+
+    /// The backend that knows how to build requests and parse responses
+    /// for this model.
+    fn provider(&self) -> Box<dyn ImageProvider> {
+        // All current models are served by Google; adding a second provider
+        // only requires a new arm here, not changes to GoogleImageProvider.
+        Box::new(GoogleImageProvider)
     }
 }
 
@@ -56,8 +67,8 @@ enum Commands {
         #[arg(short, long, default_value = "output.png")]
         output: PathBuf,
 
-        /// Image model to use (default: nano-banana-2)
-        #[arg(long, default_value = "nano-banana-2")]
+        /// Image model to use (default: nano-banana2)
+        #[arg(long, default_value = "nano-banana2")]
         model: ImageModel,
     },
 }
@@ -120,6 +131,91 @@ struct InlineData {
     data: String,
 }
 
+/// A provider-built request, ready to be sent over HTTP.
+///
+/// `headers` must not contain `Content-Type` — the generic HTTP layer uses
+/// `ureq`'s `send_json`, which sets it.
+struct ProviderRequest {
+    url: String,
+    headers: Vec<(String, String)>,
+    body: serde_json::Value,
+}
+
+/// Decoded image data returned by a provider's response parser.
+struct GeneratedImage {
+    mime_type: String,
+    data: Vec<u8>,
+}
+
+/// Abstraction over image generation backends.
+///
+/// Each provider knows how to build an HTTP request (URL, headers, body) and
+/// parse the response into image data for its specific API shape. Adding a new
+/// provider requires implementing this trait and wiring it into
+/// `ImageModel::provider()` — no existing provider code changes.
+trait ImageProvider {
+    /// Build the full request for a text-to-image generation call.
+    fn build_request(&self, api_key: &str, model_api_name: &str, prompt: &str) -> ProviderRequest;
+
+    /// Parse the provider's JSON response into decoded image data.
+    fn parse_response(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<GeneratedImage, Box<dyn std::error::Error>>;
+}
+
+/// Google Gemini image generation provider.
+struct GoogleImageProvider;
+
+impl ImageProvider for GoogleImageProvider {
+    fn build_request(&self, api_key: &str, model_api_name: &str, prompt: &str) -> ProviderRequest {
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+            model_api_name
+        );
+
+        let request = ImageRequest {
+            contents: vec![Content {
+                parts: vec![Part {
+                    text: prompt.to_string(),
+                }],
+            }],
+            generation_config: ImageGenerationConfig {
+                response_modalities: vec!["TEXT".to_string(), "IMAGE".to_string()],
+            },
+        };
+
+        ProviderRequest {
+            url,
+            // The key goes in a header, never the URL — query parameters leak
+            // credentials into shell history, proxies, and access logs.
+            headers: vec![("x-goog-api-key".to_string(), api_key.to_string())],
+            body: serde_json::to_value(&request).expect("ImageRequest is always serializable"),
+        }
+    }
+
+    fn parse_response(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<GeneratedImage, Box<dyn std::error::Error>> {
+        let response: Response = serde_json::from_value(body)?;
+
+        for candidate in &response.candidates {
+            for part in &candidate.content.parts {
+                if let Some(inline_data) = &part.inline_data {
+                    let image_data = BASE64_STANDARD.decode(&inline_data.data)?;
+                    return Ok(GeneratedImage {
+                        mime_type: inline_data.mime_type.clone(),
+                        data: image_data,
+                    });
+                }
+            }
+        }
+
+        Err("No image data in response".into())
+    }
+}
+
 /// Fetch the API key from mull secrets manager.
 ///
 /// Expects a secret named `google-ai-studio` containing the API key.
@@ -169,8 +265,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn generate_text(api_key: &str, prompt: &str) -> Result<(), Box<dyn std::error::Error>> {
     let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        TEXT_MODEL, api_key
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+        TEXT_MODEL
     );
 
     let request = TextRequest {
@@ -183,6 +279,7 @@ fn generate_text(api_key: &str, prompt: &str) -> Result<(), Box<dyn std::error::
 
     let response: Response = ureq::post(&url)
         .header("Content-Type", "application/json")
+        .header("x-goog-api-key", api_key)
         .send_json(&request)?
         .body_mut()
         .read_json()?;
@@ -203,42 +300,23 @@ fn generate_image(
     output: &PathBuf,
     model: &ImageModel,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        model.api_name(),
-        api_key
-    );
+    let provider = model.provider();
+    let req = provider.build_request(api_key, model.api_name(), prompt);
 
-    let request = ImageRequest {
-        contents: vec![Content {
-            parts: vec![Part {
-                text: prompt.to_string(),
-            }],
-        }],
-        generation_config: ImageGenerationConfig {
-            response_modalities: vec!["TEXT".to_string(), "IMAGE".to_string()],
-        },
-    };
-
-    let response: Response = ureq::post(&url)
-        .header("Content-Type", "application/json")
-        .send_json(&request)?
-        .body_mut()
-        .read_json()?;
-
-    for candidate in &response.candidates {
-        for part in &candidate.content.parts {
-            if let Some(inline_data) = &part.inline_data {
-                let image_data = BASE64_STANDARD.decode(&inline_data.data)?;
-                fs::write(output, &image_data)?;
-                println!("Image saved to: {}", output.display());
-                println!("Mime type: {}", inline_data.mime_type);
-                return Ok(());
-            }
-        }
+    let mut http = ureq::post(&req.url);
+    for (key, value) in &req.headers {
+        http = http.header(key, value);
     }
 
-    Err("No image data in response".into())
+    let response_body: serde_json::Value = http.send_json(&req.body)?.body_mut().read_json()?;
+
+    let image = provider.parse_response(response_body)?;
+
+    fs::write(output, &image.data)?;
+    println!("Image saved to: {}", output.display());
+    println!("Mime type: {}", image.mime_type);
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -335,5 +413,84 @@ mod tests {
             ImageModel::NanoBanana1.api_name(),
             "gemini-2.0-flash-exp-image-generation"
         );
+        assert_eq!(ImageModel::NanoBananaPro.api_name(), "gemini-3-pro-image");
+    }
+
+    #[test]
+    fn test_api_key_in_header_not_url() {
+        let provider = GoogleImageProvider;
+        let req = provider.build_request("test-secret-key-12345", "gemini-3-pro-image", "a cat");
+
+        let auth = req
+            .headers
+            .iter()
+            .find(|(k, _)| k == "x-goog-api-key")
+            .expect("x-goog-api-key header missing from provider request");
+        assert_eq!(auth.1, "test-secret-key-12345");
+
+        // The key must never reach the URL — query params leak into logs.
+        assert!(!req.url.contains("key="));
+        assert!(!req.url.contains("test-secret-key-12345"));
+    }
+
+    #[test]
+    fn test_provider_request_url_has_no_query_string() {
+        let provider = GoogleImageProvider;
+        let req = provider.build_request("key123", "gemini-3-pro-image", "a dog");
+        assert!(
+            !req.url.contains('?'),
+            "URL must not contain query parameters"
+        );
+    }
+
+    #[test]
+    fn test_default_model_is_nano_banana_2() {
+        assert!(matches!(ImageModel::default(), ImageModel::NanoBanana2));
+    }
+
+    #[test]
+    fn test_cli_image_default_model_parses() {
+        // The image subcommand must parse when --model is omitted. This catches
+        // a regression where default_value doesn't match a valid clap ValueEnum
+        // value (the old "nano-banana-2" vs the correct "nano-banana2").
+        let cli = Cli::try_parse_from(["nano-banana-cli", "image", "a prompt"]);
+        assert!(
+            cli.is_ok(),
+            "CLI with default model should parse: {:?}",
+            cli.err()
+        );
+    }
+
+    #[test]
+    fn test_provider_request_body_is_valid_json() {
+        let provider = GoogleImageProvider;
+        let req = provider.build_request("key", "gemini-3-pro-image", "a cat");
+
+        assert_eq!(
+            req.body["contents"][0]["parts"][0]["text"].as_str(),
+            Some("a cat")
+        );
+        assert!(req.body["generationConfig"]["responseModalities"].is_array());
+    }
+
+    #[test]
+    fn test_provider_parse_response_extracts_image() {
+        let provider = GoogleImageProvider;
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "inlineData": {
+                            "mimeType": "image/png",
+                            "data": "iVBORw0KGgo="
+                        }
+                    }]
+                }
+            }]
+        });
+
+        let image = provider.parse_response(body).expect("should parse");
+        assert_eq!(image.mime_type, "image/png");
+        assert!(!image.data.is_empty());
     }
 }
