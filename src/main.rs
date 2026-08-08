@@ -83,11 +83,15 @@ const OPENAI_MULL_SECRET_NAME: &str = "openai";
 #[command(about = "CLI for Google Gemini text generation and Google/OpenAI image generation")]
 struct Cli {
     /// Google API key (defaults to GOOGLE_AI_STUDIO_API_KEY env var, then mull secrets)
-    #[arg(long, env = "GOOGLE_AI_STUDIO_API_KEY")]
+    // `global` so the flag is accepted after the subcommand too. Without it,
+    // only `nano-banana-cli --api-key K image ...` parses, while the form users
+    // reach for first — and the one the missing-key error steers them toward —
+    // fails with "unexpected argument '--api-key' found".
+    #[arg(long, env = "GOOGLE_AI_STUDIO_API_KEY", global = true)]
     api_key: Option<String>,
 
     /// OpenAI API key (defaults to OPENAI_API_KEY env var, then mull secrets)
-    #[arg(long, env = "OPENAI_API_KEY")]
+    #[arg(long, env = "OPENAI_API_KEY", global = true)]
     openai_api_key: Option<String>,
 
     #[command(subcommand)]
@@ -705,6 +709,45 @@ mod tests {
             "--model gpt-image-2 should parse: {:?}",
             cli.err()
         );
+    }
+
+    #[test]
+    fn test_key_flags_parse_after_the_subcommand() {
+        // The missing-key error tells users to pass `--openai-api-key`, and the
+        // README documents it alongside the image flags, so the trailing form is
+        // the one they'll type. Without `global = true` clap rejects it outright.
+        let cli = Cli::try_parse_from([
+            "nano-banana-cli",
+            "image",
+            "a prompt",
+            "--model",
+            "gpt-image-2",
+            "--openai-api-key",
+            "sk-test",
+        ])
+        .expect("--openai-api-key must parse after the subcommand");
+        assert_eq!(cli.openai_api_key.as_deref(), Some("sk-test"));
+
+        let cli = Cli::try_parse_from(["nano-banana-cli", "image", "a prompt", "--api-key", "k"])
+            .expect("--api-key must parse after the subcommand");
+        assert_eq!(cli.api_key.as_deref(), Some("k"));
+
+        let cli = Cli::try_parse_from(["nano-banana-cli", "text", "a prompt", "--api-key", "k"])
+            .expect("--api-key must parse after the text subcommand");
+        assert_eq!(cli.api_key.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn test_key_flags_still_parse_before_the_subcommand() {
+        let cli = Cli::try_parse_from([
+            "nano-banana-cli",
+            "--openai-api-key",
+            "sk-test",
+            "image",
+            "a prompt",
+        ])
+        .expect("the leading form must keep working");
+        assert_eq!(cli.openai_api_key.as_deref(), Some("sk-test"));
     }
 
     #[test]
