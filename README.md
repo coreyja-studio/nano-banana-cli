@@ -61,7 +61,12 @@ Google (`text`, and all `nano-banana*` models):
 OpenAI (`--model gpt-image-2`):
 1. `--openai-api-key` flag
 2. `OPENAI_API_KEY` environment variable
-3. `openai` secret via `mull secrets`
+3. `openai-api-key` secret via `mull secrets`
+
+The OpenAI key must be a platform API key from platform.openai.com. A ChatGPT
+subscription — including the OAuth session `codex login` writes to
+`~/.codex/auth.json` — does not include one, and the Images API is billed
+separately.
 
 ## License
 

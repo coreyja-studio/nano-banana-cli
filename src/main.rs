@@ -75,8 +75,11 @@ impl AspectRatio {
 /// Secret name in mull/1Password for Google AI Studio credentials
 const MULL_SECRET_NAME: &str = "google-ai-studio";
 
-/// Secret name in mull/1Password for OpenAI credentials
-const OPENAI_MULL_SECRET_NAME: &str = "openai";
+/// Secret name in mull/1Password for OpenAI credentials.
+///
+/// Matches the name mull's own Codex harness looks up, so a single 1Password
+/// item serves both tools rather than requiring a duplicate under another name.
+const OPENAI_MULL_SECRET_NAME: &str = "openai-api-key";
 
 #[derive(Parser)]
 #[command(name = "nano-banana-cli")]
@@ -403,7 +406,11 @@ fn missing_openai_key_error(cause: &dyn std::fmt::Display) -> Box<dyn std::error
         "Could not resolve an OpenAI API key. Provide one via:\n\
          \x20 1. --openai-api-key flag\n\
          \x20 2. OPENAI_API_KEY environment variable\n\
-         \x20 3. mull secrets (1Password secret named 'openai')\n\
+         \x20 3. mull secrets (1Password secret named '{OPENAI_MULL_SECRET_NAME}')\n\
+         \n\
+         Note: this must be a platform API key from platform.openai.com, which is\n\
+         billed separately from a ChatGPT subscription. A `codex login` session\n\
+         does not supply one.\n\
          \n\
          Lookup failed with: {cause}"
     )
@@ -882,7 +889,7 @@ mod tests {
         // Asserts on the message directly rather than driving resolution: the
         // real path shells out to mull/1Password, which makes the test
         // non-hermetic and would silently stop covering this the moment the
-        // 'openai' secret is created.
+        // secret is created.
         let msg = missing_openai_key_error(&"mull is not installed").to_string();
 
         assert!(
@@ -893,9 +900,11 @@ mod tests {
             msg.contains("OPENAI_API_KEY"),
             "error must mention the OPENAI_API_KEY env var: {msg}"
         );
+        // Quoted so this can't be satisfied by the "--openai-api-key" flag text
+        // above, which would let the message and the constant drift apart.
         assert!(
-            msg.contains("openai"),
-            "error must mention the mull secret name: {msg}"
+            msg.contains(&format!("'{OPENAI_MULL_SECRET_NAME}'")),
+            "error must name the mull secret it actually looks up: {msg}"
         );
     }
 
