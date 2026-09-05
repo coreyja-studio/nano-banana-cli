@@ -53,7 +53,9 @@ impl Quality {
     }
 }
 
-/// Output aspect ratio. Consumed by OpenAI models only; Google models ignore it.
+/// Output aspect ratio. OpenAI models always honor it; among Google models
+/// only Nano Banana Pro does (`generationConfig.imageConfig.aspectRatio`) —
+/// Nano Banana 1/2 have no such parameter.
 #[derive(clap::ValueEnum, Clone, Debug, Default, PartialEq, Eq)]
 enum AspectRatio {
     #[default]
@@ -68,6 +70,18 @@ impl AspectRatio {
             AspectRatio::Square => "1024x1024",
             AspectRatio::Portrait => "1024x1536",
             AspectRatio::Landscape => "1536x1024",
+        }
+    }
+
+    /// The ratio string Gemini's `imageConfig.aspectRatio` expects. Chosen to
+    /// match the pixel ratios already used for `size_string` (1024:1536 =
+    /// 2:3, 1536:1024 = 3:2) so the two providers agree on what each variant
+    /// means.
+    fn gemini_ratio(&self) -> &'static str {
+        match self {
+            AspectRatio::Square => "1:1",
+            AspectRatio::Portrait => "2:3",
+            AspectRatio::Landscape => "3:2",
         }
     }
 }
@@ -125,7 +139,8 @@ enum Commands {
         #[arg(long, default_value = "medium")]
         quality: Quality,
 
-        /// Aspect ratio - OpenAI models only (default: square)
+        /// Aspect ratio - OpenAI and nano-banana-pro only; other Google
+        /// models warn and ignore it (default: square)
         #[arg(long, default_value = "square")]
         aspect_ratio: AspectRatio,
     },
@@ -147,6 +162,14 @@ struct ImageRequest {
 struct ImageGenerationConfig {
     #[serde(rename = "responseModalities")]
     response_modalities: Vec<String>,
+    #[serde(rename = "imageConfig", skip_serializing_if = "Option::is_none")]
+    image_config: Option<ImageConfig>,
+}
+
+#[derive(Serialize)]
+struct ImageConfig {
+    #[serde(rename = "aspectRatio")]
+    aspect_ratio: String,
 }
 
 #[derive(Serialize)]
@@ -243,7 +266,14 @@ trait ImageProvider {
 }
 
 /// Google Gemini image generation provider.
-struct GoogleImageProvider;
+///
+/// `aspect_ratio` is `Some` only when the selected model actually honors it
+/// (Nano Banana Pro); Nano Banana 1/2 have no such request field, so callers
+/// construct this with `None` for those models rather than sending a ratio
+/// the API would ignore.
+struct GoogleImageProvider {
+    aspect_ratio: Option<AspectRatio>,
+}
 
 impl ImageProvider for GoogleImageProvider {
     fn build_request(&self, api_key: &str, model_api_name: &str, prompt: &str) -> ProviderRequest {
@@ -260,6 +290,9 @@ impl ImageProvider for GoogleImageProvider {
             }],
             generation_config: ImageGenerationConfig {
                 response_modalities: vec!["TEXT".to_string(), "IMAGE".to_string()],
+                image_config: self.aspect_ratio.as_ref().map(|ratio| ImageConfig {
+                    aspect_ratio: ratio.gemini_ratio().to_string(),
+                }),
             },
         };
 
@@ -381,6 +414,69 @@ fn api_key_from_mull(secret_name: &str) -> Result<String, Box<dyn std::error::Er
         .ok_or_else(|| format!("mull secret '{}' is empty", secret_name).into())
 }
 
+/// Build the actionable "no API key" error, naming every way to supply one.
+///
+/// Shared by both providers so a fix here (or the choice of what to name)
+/// can't be applied to one credential path and forgotten in the other — which
+/// is exactly how the Google path ended up with no equivalent in the first
+/// place.
+///
+/// `cause` is preserved rather than swallowed: mull can fail with the secret
+/// fully present (1Password locked, biometric prompt declined, `mull` not
+/// installed), and telling that user their key doesn't exist sends them to fix
+/// the wrong thing. It trails the guidance rather than interrupting it: mull's
+/// own error is a multi-line block, and leading with it pushes the actionable
+/// part out of sight.
+fn missing_key_error(
+    provider_label: &str,
+    flag: &str,
+    env_var: &str,
+    secret_name: &str,
+    note: Option<&str>,
+    cause: &dyn std::fmt::Display,
+) -> Box<dyn std::error::Error> {
+    let note = note
+        .map(|n| format!("\n{n}\n"))
+        .unwrap_or_else(|| "\n".to_string());
+    format!(
+        "Could not resolve a {provider_label} API key. Provide one via:\n\
+         \x20 1. {flag} flag\n\
+         \x20 2. {env_var} environment variable\n\
+         \x20 3. mull secrets (1Password secret named '{secret_name}')\n\
+         {note}\n\
+         Lookup failed with: {cause}"
+    )
+    .into()
+}
+
+/// Build the actionable "no Google key" error, naming every way to supply one.
+fn missing_google_key_error(cause: &dyn std::fmt::Display) -> Box<dyn std::error::Error> {
+    missing_key_error(
+        "Google AI Studio",
+        "--api-key",
+        "GOOGLE_AI_STUDIO_API_KEY",
+        MULL_SECRET_NAME,
+        None,
+        cause,
+    )
+}
+
+/// Build the actionable "no OpenAI key" error, naming every way to supply one.
+fn missing_openai_key_error(cause: &dyn std::fmt::Display) -> Box<dyn std::error::Error> {
+    missing_key_error(
+        "OpenAI",
+        "--openai-api-key",
+        "OPENAI_API_KEY",
+        OPENAI_MULL_SECRET_NAME,
+        Some(
+            "Note: this must be a platform API key from platform.openai.com, which is\n\
+             billed separately from a ChatGPT subscription. A `codex login` session\n\
+             does not supply one.",
+        ),
+        cause,
+    )
+}
+
 /// Resolve the Google API key from CLI arg, env var, or mull secrets (in that order).
 fn resolve_api_key(cli_api_key: Option<String>) -> Result<String, Box<dyn std::error::Error>> {
     // CLI arg or env var already handled by clap
@@ -389,32 +485,7 @@ fn resolve_api_key(cli_api_key: Option<String>) -> Result<String, Box<dyn std::e
     }
 
     // Fall back to mull secrets
-    api_key_from_mull(MULL_SECRET_NAME)
-}
-
-/// Build the actionable "no OpenAI key" error, naming every way to supply one.
-///
-/// `cause` is preserved rather than swallowed: mull can fail with the secret
-/// fully present (1Password locked, biometric prompt declined, `mull` not
-/// installed), and telling that user their key doesn't exist sends them to fix
-/// the wrong thing.
-/// The cause trails the guidance rather than interrupting it: mull's own error
-/// is a multi-line block, and leading with it pushes the actionable part out of
-/// sight.
-fn missing_openai_key_error(cause: &dyn std::fmt::Display) -> Box<dyn std::error::Error> {
-    format!(
-        "Could not resolve an OpenAI API key. Provide one via:\n\
-         \x20 1. --openai-api-key flag\n\
-         \x20 2. OPENAI_API_KEY environment variable\n\
-         \x20 3. mull secrets (1Password secret named '{OPENAI_MULL_SECRET_NAME}')\n\
-         \n\
-         Note: this must be a platform API key from platform.openai.com, which is\n\
-         billed separately from a ChatGPT subscription. A `codex login` session\n\
-         does not supply one.\n\
-         \n\
-         Lookup failed with: {cause}"
-    )
-    .into()
+    api_key_from_mull(MULL_SECRET_NAME).map_err(|e| missing_google_key_error(&e))
 }
 
 /// Resolve the OpenAI API key from CLI arg, env var, or mull secrets.
@@ -471,35 +542,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn generate_text(api_key: &str, prompt: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
-        TEXT_MODEL
-    );
-
-    let request = TextRequest {
-        contents: vec![Content {
-            parts: vec![Part {
-                text: prompt.to_string(),
-            }],
-        }],
-    };
-
-    let response: Response = ureq::post(&url)
-        .header("Content-Type", "application/json")
-        .header("x-goog-api-key", api_key)
-        .send_json(&request)?
-        .body_mut()
-        .read_json()?;
-
-    if let Some(candidate) = response.candidates.first()
-        && let Some(part) = candidate.content.parts.first()
-        && let Some(text) = &part.text
-    {
-        println!("{}", text);
-    }
-
-    Ok(())
+/// Build the shared HTTP agent used for every API call.
+///
+/// Both the text and image APIs explain 4xx/5xx failures only in the response
+/// body (invalid key, quota, moderation rejection). ureq's default agent
+/// turns those into `Error::StatusCode(u16)`, which discards the body and
+/// prints a bare "http status: N" — so status handling is taken over
+/// manually, in [`read_json_or_status_error`], for every call site.
+fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent()
 }
 
 /// Cap an API error body so a gateway's HTML page can't flood the terminal.
@@ -514,6 +568,82 @@ fn truncate_for_display(body: &str) -> String {
 
     let head: String = body.chars().take(MAX_CHARS).collect();
     format!("{}... (truncated)", head)
+}
+
+/// Turn a response from [`http_agent`] into its parsed JSON body, or an error
+/// that includes the (truncated) response body — where a bad key, quota
+/// rejection, or moderation failure actually explains itself.
+fn read_json_or_status_error<T: serde::de::DeserializeOwned>(
+    mut response: ureq::http::Response<ureq::Body>,
+    label: &str,
+) -> Result<T, Box<dyn std::error::Error>> {
+    let status = response.status();
+
+    if !status.is_success() {
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .unwrap_or_else(|e| format!("<unreadable response body: {}>", e));
+        return Err(format!(
+            "{} API error (HTTP {}): {}",
+            label,
+            status.as_u16(),
+            truncate_for_display(body.trim())
+        )
+        .into());
+    }
+
+    Ok(response.body_mut().read_json()?)
+}
+
+fn generate_text(api_key: &str, prompt: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+        TEXT_MODEL
+    );
+
+    let request = TextRequest {
+        contents: vec![Content {
+            parts: vec![Part {
+                text: prompt.to_string(),
+            }],
+        }],
+    };
+
+    let response = http_agent()
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("x-goog-api-key", api_key)
+        .send_json(&request)?;
+
+    let response: Response = read_json_or_status_error(response, "Text")?;
+
+    if let Some(candidate) = response.candidates.first()
+        && let Some(part) = candidate.content.parts.first()
+        && let Some(text) = &part.text
+    {
+        println!("{}", text);
+    }
+
+    Ok(())
+}
+
+/// A user-facing warning when `--aspect-ratio` was set to a non-default value
+/// but `model` has no request field to carry it, so the flag would otherwise
+/// be dropped with no indication (`None` for the default value, since a
+/// square image matches what was asked for either way).
+fn dropped_aspect_ratio_warning(model: &ImageModel, aspect_ratio: &AspectRatio) -> Option<String> {
+    if matches!(model, ImageModel::NanoBanana1 | ImageModel::NanoBanana2)
+        && *aspect_ratio != AspectRatio::default()
+    {
+        Some(format!(
+            "--aspect-ratio is not supported by {} and will be ignored (only \
+             nano-banana-pro honors it on Google); the image will be square.",
+            model.api_name()
+        ))
+    } else {
+        None
+    }
 }
 
 fn generate_image(
@@ -535,52 +665,41 @@ fn generate_image(
                 aspect_ratio: aspect_ratio.clone(),
             }),
         ),
+        // Only Nano Banana Pro's API accepts an aspect ratio; 1/2 have no such
+        // field. Dropping the flag there is fine, but doing it silently isn't
+        // — see `dropped_aspect_ratio_warning`.
+        ImageModel::NanoBananaPro => (
+            resolve_api_key(google_api_key)?,
+            Box::new(GoogleImageProvider {
+                aspect_ratio: Some(aspect_ratio.clone()),
+            }),
+        ),
         // Listed exhaustively rather than with a `_` arm: a future model added
         // without a match arm should fail to compile, not silently route to
         // Google and surface as an unexplained HTTP 400.
         //
-        // Quality and aspect ratio are intentionally ignored for Google models
-        // rather than rejected, so the flags are safe to always pass.
-        ImageModel::NanoBanana2 | ImageModel::NanoBanana1 | ImageModel::NanoBananaPro => (
-            resolve_api_key(google_api_key)?,
-            Box::new(GoogleImageProvider),
-        ),
+        // Quality is intentionally ignored for Google models rather than
+        // rejected, so the flag is safe to always pass.
+        ImageModel::NanoBanana2 | ImageModel::NanoBanana1 => {
+            if let Some(warning) = dropped_aspect_ratio_warning(model, aspect_ratio) {
+                eprintln!("Warning: {warning}");
+            }
+            (
+                resolve_api_key(google_api_key)?,
+                Box::new(GoogleImageProvider { aspect_ratio: None }),
+            )
+        }
     };
 
     let req = provider.build_request(&api_key, model.api_name(), prompt);
 
-    // Both image APIs explain 4xx/5xx failures only in the response body
-    // (invalid key, unverified organization, moderation rejection, quota).
-    // ureq's default turns those into `Error::StatusCode(u16)`, which discards
-    // the body and prints a bare "http status: N", so status handling is taken
-    // over here — once, for every provider.
-    let agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent();
-
-    let mut http = agent.post(&req.url);
+    let mut http = http_agent().post(&req.url);
     for (key, value) in &req.headers {
         http = http.header(key, value);
     }
 
-    let mut response = http.send_json(&req.body)?;
-    let status = response.status();
-
-    if !status.is_success() {
-        let body = response
-            .body_mut()
-            .read_to_string()
-            .unwrap_or_else(|e| format!("<unreadable response body: {}>", e));
-        return Err(format!(
-            "Image API error (HTTP {}): {}",
-            status.as_u16(),
-            truncate_for_display(body.trim())
-        )
-        .into());
-    }
-
-    let response_body: serde_json::Value = response.body_mut().read_json()?;
+    let response = http.send_json(&req.body)?;
+    let response_body: serde_json::Value = read_json_or_status_error(response, "Image")?;
 
     let image = provider.parse_response(response_body)?;
 
@@ -623,6 +742,7 @@ mod tests {
             }],
             generation_config: ImageGenerationConfig {
                 response_modalities: vec!["TEXT".to_string(), "IMAGE".to_string()],
+                image_config: None,
             },
         };
 
@@ -631,6 +751,9 @@ mod tests {
         assert!(json.contains("generationConfig"));
         assert!(json.contains("responseModalities"));
         assert!(json.contains("IMAGE"));
+        // `image_config: None` must not appear as a JSON null — Google's API
+        // rejects unrecognized/null fields on some endpoints.
+        assert!(!json.contains("imageConfig"));
     }
 
     #[test]
@@ -920,6 +1043,36 @@ mod tests {
     }
 
     #[test]
+    fn test_google_key_missing_error_names_every_source() {
+        // Mirrors test_openai_key_missing_error_names_every_source: the two
+        // providers share `missing_key_error`, so the same guarantee must
+        // hold for Google's flag, env var, and secret name.
+        let msg = missing_google_key_error(&"mull is not installed").to_string();
+
+        assert!(
+            msg.contains("--api-key"),
+            "error must mention the --api-key flag: {msg}"
+        );
+        assert!(
+            msg.contains("GOOGLE_AI_STUDIO_API_KEY"),
+            "error must mention the GOOGLE_AI_STUDIO_API_KEY env var: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("'{MULL_SECRET_NAME}'")),
+            "error must name the mull secret it actually looks up: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_google_key_error_preserves_cause() {
+        let msg = missing_google_key_error(&"1Password is locked").to_string();
+        assert!(
+            msg.contains("1Password is locked"),
+            "the underlying cause must survive into the message: {msg}"
+        );
+    }
+
+    #[test]
     fn test_blank_cli_key_is_treated_as_absent() {
         // clap hands over Some("") for `export OPENAI_API_KEY=`, which must not
         // short-circuit resolution into sending `Authorization: Bearer `.
@@ -984,7 +1137,7 @@ mod tests {
 
     #[test]
     fn test_api_key_in_header_not_url() {
-        let provider = GoogleImageProvider;
+        let provider = GoogleImageProvider { aspect_ratio: None };
         let req = provider.build_request("test-secret-key-12345", "gemini-3-pro-image", "a cat");
 
         let auth = req
@@ -1001,7 +1154,7 @@ mod tests {
 
     #[test]
     fn test_provider_request_url_has_no_query_string() {
-        let provider = GoogleImageProvider;
+        let provider = GoogleImageProvider { aspect_ratio: None };
         let req = provider.build_request("key123", "gemini-3-pro-image", "a dog");
         assert!(
             !req.url.contains('?'),
@@ -1029,7 +1182,7 @@ mod tests {
 
     #[test]
     fn test_provider_request_body_is_valid_json() {
-        let provider = GoogleImageProvider;
+        let provider = GoogleImageProvider { aspect_ratio: None };
         let req = provider.build_request("key", "gemini-3-pro-image", "a cat");
 
         assert_eq!(
@@ -1041,7 +1194,7 @@ mod tests {
 
     #[test]
     fn test_provider_parse_response_extracts_image() {
-        let provider = GoogleImageProvider;
+        let provider = GoogleImageProvider { aspect_ratio: None };
         let body = serde_json::json!({
             "candidates": [{
                 "content": {
@@ -1058,5 +1211,107 @@ mod tests {
         let image = provider.parse_response(body).expect("should parse");
         assert_eq!(image.mime_type, "image/png");
         assert!(!image.data.is_empty());
+    }
+
+    #[test]
+    fn test_google_provider_omits_image_config_when_aspect_ratio_absent() {
+        let provider = GoogleImageProvider { aspect_ratio: None };
+        let req = provider.build_request("key", "gemini-3.1-flash-image-preview", "a cat");
+        assert!(
+            req.body
+                .get("generationConfig")
+                .unwrap()
+                .get("imageConfig")
+                .is_none(),
+            "imageConfig must be omitted, not sent as null, when no aspect ratio applies: {:?}",
+            req.body
+        );
+    }
+
+    #[test]
+    fn test_google_provider_sends_aspect_ratio_when_present() {
+        // This is the behavior the task exists for: a Nano Banana Pro request
+        // must actually carry --aspect-ratio, not just accept and drop it.
+        let provider = GoogleImageProvider {
+            aspect_ratio: Some(AspectRatio::Landscape),
+        };
+        let req = provider.build_request("key", "gemini-3-pro-image", "a cat");
+        assert_eq!(
+            req.body["generationConfig"]["imageConfig"]["aspectRatio"].as_str(),
+            Some("3:2")
+        );
+    }
+
+    #[test]
+    fn test_gemini_ratio_values() {
+        assert_eq!(AspectRatio::Square.gemini_ratio(), "1:1");
+        assert_eq!(AspectRatio::Portrait.gemini_ratio(), "2:3");
+        assert_eq!(AspectRatio::Landscape.gemini_ratio(), "3:2");
+    }
+
+    #[test]
+    fn test_dropped_aspect_ratio_warning_fires_for_non_pro_google_models() {
+        let warning =
+            dropped_aspect_ratio_warning(&ImageModel::NanoBanana2, &AspectRatio::Landscape)
+                .expect("a non-default aspect ratio on nano-banana2 must warn");
+        assert!(warning.contains("nano-banana-pro"));
+        assert!(warning.contains(ImageModel::NanoBanana2.api_name()));
+
+        assert!(
+            dropped_aspect_ratio_warning(&ImageModel::NanoBanana1, &AspectRatio::Portrait)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_dropped_aspect_ratio_warning_silent_when_not_dropped() {
+        // Default value: nothing was actually requested, so there's nothing to
+        // warn about even though the model can't honor a non-default one.
+        assert!(
+            dropped_aspect_ratio_warning(&ImageModel::NanoBanana2, &AspectRatio::Square).is_none()
+        );
+        // Pro and GPT Image 2 both honor the flag themselves.
+        assert!(
+            dropped_aspect_ratio_warning(&ImageModel::NanoBananaPro, &AspectRatio::Landscape)
+                .is_none()
+        );
+        assert!(
+            dropped_aspect_ratio_warning(&ImageModel::GptImage2, &AspectRatio::Landscape).is_none()
+        );
+    }
+
+    #[test]
+    fn test_read_json_or_status_error_surfaces_response_body() {
+        // The defect this guards: ureq's default agent turns a non-2xx status
+        // into `Error::StatusCode(u16)`, discarding the body that actually
+        // explains a bad key, quota, or moderation rejection. Both
+        // generate_text and generate_image now route through this one
+        // function, so a fix here can't be forgotten on the other path.
+        let response = ureq::http::Response::builder()
+            .status(400)
+            .body(ureq::Body::builder().data(r#"{"error":"API key not valid"}"#))
+            .unwrap();
+
+        let Err(err) = read_json_or_status_error::<serde_json::Value>(response, "Text") else {
+            panic!("a 400 status must not parse as success");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("400"), "error must include the status: {msg}");
+        assert!(
+            msg.contains("API key not valid"),
+            "error must include the response body, not just the status: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_read_json_or_status_error_parses_success() {
+        let response = ureq::http::Response::builder()
+            .status(200)
+            .body(ureq::Body::builder().data(r#"{"ok":true}"#))
+            .unwrap();
+
+        let value: serde_json::Value =
+            read_json_or_status_error(response, "Text").expect("2xx must parse normally");
+        assert_eq!(value["ok"], serde_json::json!(true));
     }
 }
