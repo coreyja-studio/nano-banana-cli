@@ -5,7 +5,14 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
-const TEXT_MODEL: &str = "gemini-2.0-flash";
+/// Model backing the `text` subcommand.
+///
+/// Pinned rather than using the rolling `gemini-flash-latest` alias so output
+/// doesn't change under the user without a commit. The cost of pinning is that
+/// Google eventually retires the version — `gemini-2.0-flash`, the previous
+/// value here, now hard-404s with "no longer available" — so this const is
+/// expected to need periodic bumping.
+const TEXT_MODEL: &str = "gemini-3.6-flash";
 
 #[derive(clap::ValueEnum, Clone, Debug, Default)]
 enum ImageModel {
@@ -203,6 +210,26 @@ struct ResponsePart {
     text: Option<String>,
     #[serde(default, rename = "inlineData")]
     inline_data: Option<InlineData>,
+    /// Set on reasoning-summary parts emitted by the Gemini 3.x thinking
+    /// models. Such a part carries `text`, so it is indistinguishable from the
+    /// answer without this flag.
+    #[serde(default)]
+    thought: Option<bool>,
+}
+
+impl ResponsePart {
+    /// The user-facing text of this part, if it has any.
+    ///
+    /// Reasoning summaries are excluded: they are the model's scratchpad, not
+    /// its answer, and printing one in place of the answer is worse than
+    /// printing nothing.
+    fn answer_text(&self) -> Option<&str> {
+        if self.thought == Some(true) {
+            return None;
+        }
+
+        self.text.as_deref()
+    }
 }
 
 #[derive(Deserialize)]
@@ -618,12 +645,7 @@ fn generate_text(api_key: &str, prompt: &str) -> Result<(), Box<dyn std::error::
 
     let response: Response = read_json_or_status_error(response, "Text")?;
 
-    if let Some(candidate) = response.candidates.first()
-        && let Some(part) = candidate.content.parts.first()
-        && let Some(text) = &part.text
-    {
-        println!("{}", text);
-    }
+    println!("{}", extract_text(&response)?);
 
     Ok(())
 }
@@ -644,6 +666,34 @@ fn dropped_aspect_ratio_warning(model: &ImageModel, aspect_ratio: &AspectRatio) 
     } else {
         None
     }
+}
+
+/// Pull the answer out of a `generateContent` response.
+///
+/// Joins every text part of the first candidate rather than reading
+/// `parts[0].text`: the API is free to split one answer across parts, and a
+/// thinking model can put a reasoning summary in front of it. The old
+/// first-part-only read silently printed nothing — and still exited 0 — when
+/// either happened, or when the candidate was cut short by a safety filter.
+fn extract_text(response: &Response) -> Result<String, Box<dyn std::error::Error>> {
+    let candidate = response
+        .candidates
+        .first()
+        .ok_or("Model returned no candidates")?;
+
+    let text = candidate
+        .content
+        .parts
+        .iter()
+        .filter_map(ResponsePart::answer_text)
+        .collect::<Vec<_>>()
+        .join("");
+
+    if text.is_empty() {
+        return Err("Model returned no text (the response may have been blocked)".into());
+    }
+
+    Ok(text)
 }
 
 fn generate_image(
@@ -1313,5 +1363,93 @@ mod tests {
         let value: serde_json::Value =
             read_json_or_status_error(response, "Text").expect("2xx must parse normally");
         assert_eq!(value["ok"], serde_json::json!(true));
+    }
+
+    /// Build a `Response` from the raw JSON the API actually returns, rather
+    /// than constructing the structs directly — these tests are as much about
+    /// the serde attributes (`thought`, `#[serde(default)]`) as about
+    /// `extract_text`, and hand-built structs would skip that half.
+    fn response_from_json(json: &str) -> Response {
+        serde_json::from_str(json).expect("test fixture should deserialize")
+    }
+
+    #[test]
+    fn test_text_model_is_not_the_retired_one() {
+        // gemini-2.0-flash is retired and returns a hard 404: "This model
+        // models/gemini-2.0-flash is no longer available."
+        assert_ne!(TEXT_MODEL, "gemini-2.0-flash");
+    }
+
+    #[test]
+    fn test_extract_text_single_part() {
+        let response = response_from_json(
+            r#"{"candidates": [{"content": {"parts": [{"text": "The sky is blue."}]}}]}"#,
+        );
+
+        assert_eq!(extract_text(&response).unwrap(), "The sky is blue.");
+    }
+
+    #[test]
+    fn test_extract_text_joins_split_parts() {
+        // The API may split one answer across parts; reading only parts[0]
+        // truncated the response.
+        let response = response_from_json(
+            r#"{"candidates": [{"content": {"parts": [
+                {"text": "Hello, "},
+                {"text": "world."}
+            ]}}]}"#,
+        );
+
+        assert_eq!(extract_text(&response).unwrap(), "Hello, world.");
+    }
+
+    #[test]
+    fn test_extract_text_skips_reasoning_summary() {
+        // A thinking model can put its scratchpad first. Printing that instead
+        // of the answer is the failure this guards against.
+        let response = response_from_json(
+            r#"{"candidates": [{"content": {"parts": [
+                {"text": "First I should consider...", "thought": true},
+                {"text": "42"}
+            ]}}]}"#,
+        );
+
+        assert_eq!(extract_text(&response).unwrap(), "42");
+    }
+
+    #[test]
+    fn test_extract_text_tolerates_thought_signature() {
+        // Gemini 3.x attaches `thoughtSignature` to ordinary answer parts. It
+        // is not `thought: true` and must not be filtered out.
+        let response = response_from_json(
+            r#"{"candidates": [{"content": {"parts": [
+                {"text": "Hi", "thoughtSignature": "EsoDCscDARFNMg"}
+            ]}}]}"#,
+        );
+
+        assert_eq!(extract_text(&response).unwrap(), "Hi");
+    }
+
+    #[test]
+    fn test_extract_text_errors_when_only_reasoning() {
+        // Previously this printed nothing and exited 0, which reads as "the
+        // model had nothing to say" rather than "something went wrong".
+        let response = response_from_json(
+            r#"{"candidates": [{"content": {"parts": [
+                {"text": "thinking...", "thought": true}
+            ]}}]}"#,
+        );
+
+        let err = extract_text(&response).unwrap_err().to_string();
+        assert!(err.contains("no text"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_extract_text_errors_on_no_candidates() {
+        // What a safety-blocked prompt comes back as.
+        let response = response_from_json(r#"{"candidates": []}"#);
+
+        let err = extract_text(&response).unwrap_err().to_string();
+        assert!(err.contains("no candidates"), "unexpected error: {err}");
     }
 }
