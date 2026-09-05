@@ -2,7 +2,7 @@
 name = "nano-banana-cli"
 version = "0.1.0"
 edition = "2024"
-description = "CLI for interacting with Google Gemini Nano Banana Pro"
+description = "CLI for Google Gemini text generation and Google/OpenAI image generation"
 license = "MIT"
 
 [dependencies]
