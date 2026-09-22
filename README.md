@@ -42,9 +42,12 @@ GPT Image 2 is the strongest option for images containing rendered text. It
 also accepts `--quality` (`low`, `medium`, `high`; default `medium`) and
 `--aspect-ratio` (`square`, `portrait`, `landscape`; default `square`).
 `--quality` is ignored by every Google model. `--aspect-ratio` is honored by
-`nano-banana-pro` too (via Gemini's `imageConfig`); passing a non-default
-value with `nano-banana1`/`nano-banana2`, which have no such parameter,
-prints a warning and produces a square image.
+`nano-banana-pro` too (via Gemini's `imageConfig`). `nano-banana1` and
+`nano-banana2` ignore any explicit `--aspect-ratio` value, print a warning,
+and choose their framing from the prompt. Without `--output`, the CLI saves
+the image as `output.<ext>` using the type returned by the model. An explicit
+output path is honored, with a warning if its extension disagrees with that
+type.
 
 ```bash
 nano-banana-cli image "a poster reading GRAND OPENING" \

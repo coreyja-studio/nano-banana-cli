@@ -2,7 +2,7 @@ use base64::{Engine, prelude::BASE64_STANDARD};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 /// Model backing the `text` subcommand.
@@ -134,9 +134,10 @@ enum Commands {
         /// The prompt describing the image to generate
         prompt: String,
 
-        /// Output file path (defaults to output.png)
-        #[arg(short, long, default_value = "output.png")]
-        output: PathBuf,
+        /// Output file path (defaults to output.<ext>, with the extension
+        /// taken from the image type the model returns)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
 
         /// Image model to use (default: nano-banana2)
         #[arg(long, default_value = "nano-banana2")]
@@ -146,10 +147,12 @@ enum Commands {
         #[arg(long, default_value = "medium")]
         quality: Quality,
 
-        /// Aspect ratio - OpenAI and nano-banana-pro only; other Google
-        /// models warn and ignore it (default: square)
-        #[arg(long, default_value = "square")]
-        aspect_ratio: AspectRatio,
+        /// Aspect ratio - OpenAI and nano-banana-pro only (default: square);
+        /// nano-banana1/2 ignore it and frame the image from the prompt
+        // No clap default: an explicit value must be distinguishable from an
+        // absent one, so passing it to a model that drops it always warns.
+        #[arg(long)]
+        aspect_ratio: Option<AspectRatio>,
     },
 }
 
@@ -189,18 +192,69 @@ struct Part {
     text: String,
 }
 
+/// A `generateContent` response.
+///
+/// Every field is optional because a blocked request is still an HTTP 200: a
+/// blocked *prompt* comes back with no `candidates` at all and only
+/// `promptFeedback.blockReason`, and a blocked *answer* comes back as a
+/// candidate with a `finishReason` and no `content`.
 #[derive(Deserialize)]
 struct Response {
+    #[serde(default)]
     candidates: Vec<Candidate>,
+    #[serde(default, rename = "promptFeedback")]
+    prompt_feedback: Option<PromptFeedback>,
+}
+
+impl Response {
+    /// Why the response carries no usable output, as reported by the API —
+    /// `blockReason` for a rejected prompt, else the first candidate's
+    /// `finishReason` — formatted for appending to an error message.
+    fn block_explanation(&self) -> String {
+        let block_reason = self
+            .prompt_feedback
+            .as_ref()
+            .and_then(|feedback| feedback.block_reason.as_deref());
+        if let Some(reason) = block_reason {
+            return format!(" (prompt blocked: {reason})");
+        }
+
+        match self
+            .candidates
+            .first()
+            .and_then(|candidate| candidate.finish_reason.as_deref())
+        {
+            Some(reason) => format!(" (finish reason: {reason})"),
+            None => String::new(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct PromptFeedback {
+    #[serde(default, rename = "blockReason")]
+    block_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct Candidate {
-    content: CandidateContent,
+    #[serde(default)]
+    content: Option<CandidateContent>,
+    #[serde(default, rename = "finishReason")]
+    finish_reason: Option<String>,
+}
+
+impl Candidate {
+    fn parts(&self) -> &[ResponsePart] {
+        self.content
+            .as_ref()
+            .map_or(&[], |content| content.parts.as_slice())
+    }
 }
 
 #[derive(Deserialize)]
 struct CandidateContent {
+    #[serde(default)]
     parts: Vec<ResponsePart>,
 }
 
@@ -339,7 +393,7 @@ impl ImageProvider for GoogleImageProvider {
         let response: Response = serde_json::from_value(body)?;
 
         for candidate in &response.candidates {
-            for part in &candidate.content.parts {
+            for part in candidate.parts() {
                 if let Some(inline_data) = &part.inline_data {
                     let image_data = BASE64_STANDARD.decode(&inline_data.data)?;
                     return Ok(GeneratedImage {
@@ -350,7 +404,7 @@ impl ImageProvider for GoogleImageProvider {
             }
         }
 
-        Err("No image data in response".into())
+        Err(format!("No image data in response{}", response.block_explanation()).into())
     }
 }
 
@@ -559,10 +613,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             cli.api_key,
             cli.openai_api_key,
             &prompt,
-            &output,
+            output.as_deref(),
             &model,
             &quality,
-            &aspect_ratio,
+            aspect_ratio.as_ref(),
         )?,
     }
 
@@ -650,17 +704,23 @@ fn generate_text(api_key: &str, prompt: &str) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// A user-facing warning when `--aspect-ratio` was set to a non-default value
-/// but `model` has no request field to carry it, so the flag would otherwise
-/// be dropped with no indication (`None` for the default value, since a
-/// square image matches what was asked for either way).
-fn dropped_aspect_ratio_warning(model: &ImageModel, aspect_ratio: &AspectRatio) -> Option<String> {
-    if matches!(model, ImageModel::NanoBanana1 | ImageModel::NanoBanana2)
-        && *aspect_ratio != AspectRatio::default()
+/// A user-facing warning when `--aspect-ratio` was passed but `model` has no
+/// request field to carry it, so the flag would otherwise be dropped with no
+/// indication.
+///
+/// Any explicit value warns, `square` included: Nano Banana 1/2 do not
+/// default to square, they choose their own framing from the prompt
+/// (measured ~16:9 for both square and landscape requests).
+fn dropped_aspect_ratio_warning(
+    model: &ImageModel,
+    aspect_ratio: Option<&AspectRatio>,
+) -> Option<String> {
+    if matches!(model, ImageModel::NanoBanana1 | ImageModel::NanoBanana2) && aspect_ratio.is_some()
     {
         Some(format!(
             "--aspect-ratio is not supported by {} and will be ignored (only \
-             nano-banana-pro honors it on Google); the image will be square.",
+             nano-banana-pro honors it on Google); the model picks its own \
+             framing from the prompt.",
             model.api_name()
         ))
     } else {
@@ -676,34 +736,79 @@ fn dropped_aspect_ratio_warning(model: &ImageModel, aspect_ratio: &AspectRatio) 
 /// first-part-only read silently printed nothing — and still exited 0 — when
 /// either happened, or when the candidate was cut short by a safety filter.
 fn extract_text(response: &Response) -> Result<String, Box<dyn std::error::Error>> {
-    let candidate = response
-        .candidates
-        .first()
-        .ok_or("Model returned no candidates")?;
+    let Some(candidate) = response.candidates.first() else {
+        return Err(format!(
+            "Model returned no candidates{}",
+            response.block_explanation()
+        )
+        .into());
+    };
 
     let text = candidate
-        .content
-        .parts
+        .parts()
         .iter()
         .filter_map(ResponsePart::answer_text)
         .collect::<Vec<_>>()
         .join("");
 
     if text.is_empty() {
-        return Err("Model returned no text (the response may have been blocked)".into());
+        return Err(match candidate.finish_reason.as_deref() {
+            Some(reason) => format!("Model returned no text (finish reason: {reason})").into(),
+            None => "Model returned no text (the response may have been blocked)".into(),
+        });
     }
 
     Ok(text)
+}
+
+/// The file extension for an image MIME type this CLI knows about.
+fn extension_for_mime(mime_type: &str) -> Option<&'static str> {
+    match mime_type {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        _ => None,
+    }
+}
+
+/// Where to save the image when `-o` was not given: `output.<ext>` for the
+/// type the model actually returned. The Gemini image models return JPEG, so
+/// a fixed `output.png` mislabeled the default case.
+fn default_output_path(mime_type: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "output.{}",
+        extension_for_mime(mime_type).unwrap_or("bin")
+    ))
+}
+
+/// A warning when an explicit `-o` path's extension disagrees with the
+/// returned image type. The path is still honored — the user asked for it —
+/// but extension-driven tools (web servers, uploaders, ImageMagick) will
+/// misread the file.
+fn extension_mismatch_warning(path: &Path, mime_type: &str) -> Option<String> {
+    let expected = extension_for_mime(mime_type)?;
+    let actual = path.extension()?.to_str()?.to_ascii_lowercase();
+    let matches = actual == expected || (expected == "jpg" && actual == "jpeg");
+    if matches {
+        return None;
+    }
+
+    Some(format!(
+        "the model returned {mime_type} but {} has a .{actual} extension; \
+         consider -o with .{expected}",
+        path.display()
+    ))
 }
 
 fn generate_image(
     google_api_key: Option<String>,
     openai_api_key: Option<String>,
     prompt: &str,
-    output: &PathBuf,
+    output: Option<&Path>,
     model: &ImageModel,
     quality: &Quality,
-    aspect_ratio: &AspectRatio,
+    aspect_ratio: Option<&AspectRatio>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Credentials resolve inside the arm for the selected provider, so an
     // unused provider's missing key never blocks a run.
@@ -712,7 +817,7 @@ fn generate_image(
             resolve_openai_api_key(openai_api_key)?,
             Box::new(OpenAIImageProvider {
                 quality: quality.clone(),
-                aspect_ratio: aspect_ratio.clone(),
+                aspect_ratio: aspect_ratio.cloned().unwrap_or_default(),
             }),
         ),
         // Only Nano Banana Pro's API accepts an aspect ratio; 1/2 have no such
@@ -721,7 +826,7 @@ fn generate_image(
         ImageModel::NanoBananaPro => (
             resolve_api_key(google_api_key)?,
             Box::new(GoogleImageProvider {
-                aspect_ratio: Some(aspect_ratio.clone()),
+                aspect_ratio: Some(aspect_ratio.cloned().unwrap_or_default()),
             }),
         ),
         // Listed exhaustively rather than with a `_` arm: a future model added
@@ -753,7 +858,17 @@ fn generate_image(
 
     let image = provider.parse_response(response_body)?;
 
-    fs::write(output, &image.data)?;
+    let output = match output {
+        Some(path) => {
+            if let Some(warning) = extension_mismatch_warning(path, &image.mime_type) {
+                eprintln!("Warning: {warning}");
+            }
+            path.to_path_buf()
+        }
+        None => default_output_path(&image.mime_type),
+    };
+
+    fs::write(&output, &image.data)?;
     println!("Image saved to: {}", output.display());
     println!("Mime type: {}", image.mime_type);
 
@@ -819,7 +934,7 @@ mod tests {
         let response: Response = serde_json::from_str(json).unwrap();
         assert_eq!(response.candidates.len(), 1);
         assert_eq!(
-            response.candidates[0].content.parts[0].text,
+            response.candidates[0].parts()[0].text,
             Some("Hello back!".to_string())
         );
     }
@@ -841,7 +956,7 @@ mod tests {
 
         let response: Response = serde_json::from_str(json).unwrap();
         assert_eq!(response.candidates.len(), 1);
-        let inline_data = response.candidates[0].content.parts[0]
+        let inline_data = response.candidates[0].parts()[0]
             .inline_data
             .as_ref()
             .unwrap();
@@ -1302,32 +1417,156 @@ mod tests {
     #[test]
     fn test_dropped_aspect_ratio_warning_fires_for_non_pro_google_models() {
         let warning =
-            dropped_aspect_ratio_warning(&ImageModel::NanoBanana2, &AspectRatio::Landscape)
-                .expect("a non-default aspect ratio on nano-banana2 must warn");
+            dropped_aspect_ratio_warning(&ImageModel::NanoBanana2, Some(&AspectRatio::Landscape))
+                .expect("an aspect ratio on nano-banana2 must warn");
         assert!(warning.contains("nano-banana-pro"));
         assert!(warning.contains(ImageModel::NanoBanana2.api_name()));
 
         assert!(
-            dropped_aspect_ratio_warning(&ImageModel::NanoBanana1, &AspectRatio::Portrait)
+            dropped_aspect_ratio_warning(&ImageModel::NanoBanana1, Some(&AspectRatio::Portrait))
                 .is_some()
         );
     }
 
     #[test]
-    fn test_dropped_aspect_ratio_warning_silent_when_not_dropped() {
-        // Default value: nothing was actually requested, so there's nothing to
-        // warn about even though the model can't honor a non-default one.
+    fn test_dropped_aspect_ratio_warning_fires_for_explicit_square() {
+        // Nano Banana 1/2 don't default to square either, so an explicit
+        // `--aspect-ratio square` is dropped just like any other value.
         assert!(
-            dropped_aspect_ratio_warning(&ImageModel::NanoBanana2, &AspectRatio::Square).is_none()
+            dropped_aspect_ratio_warning(&ImageModel::NanoBanana2, Some(&AspectRatio::Square))
+                .is_some()
         );
+    }
+
+    #[test]
+    fn test_dropped_aspect_ratio_warning_does_not_promise_square() {
+        // Measured: nano-banana2 returned 1408x768 for a "square" request.
+        let warning =
+            dropped_aspect_ratio_warning(&ImageModel::NanoBanana2, Some(&AspectRatio::Landscape))
+                .unwrap();
+        assert!(!warning.contains("square"), "{warning}");
+        assert!(warning.contains("framing from the prompt"), "{warning}");
+    }
+
+    #[test]
+    fn test_dropped_aspect_ratio_warning_silent_when_not_dropped() {
+        // Flag absent: nothing was requested, so there's nothing to warn about.
+        assert!(dropped_aspect_ratio_warning(&ImageModel::NanoBanana2, None).is_none());
         // Pro and GPT Image 2 both honor the flag themselves.
         assert!(
-            dropped_aspect_ratio_warning(&ImageModel::NanoBananaPro, &AspectRatio::Landscape)
+            dropped_aspect_ratio_warning(&ImageModel::NanoBananaPro, Some(&AspectRatio::Landscape))
                 .is_none()
         );
         assert!(
-            dropped_aspect_ratio_warning(&ImageModel::GptImage2, &AspectRatio::Landscape).is_none()
+            dropped_aspect_ratio_warning(&ImageModel::GptImage2, Some(&AspectRatio::Landscape))
+                .is_none()
         );
+    }
+
+    #[test]
+    fn test_cli_aspect_ratio_is_absent_unless_passed() {
+        let cli = Cli::try_parse_from(["nano-banana-cli", "image", "a cat"]).unwrap();
+        let Commands::Image { aspect_ratio, .. } = cli.command else {
+            panic!("expected image subcommand");
+        };
+        assert_eq!(aspect_ratio, None);
+
+        let cli = Cli::try_parse_from([
+            "nano-banana-cli",
+            "image",
+            "a cat",
+            "--aspect-ratio",
+            "square",
+        ])
+        .unwrap();
+        let Commands::Image { aspect_ratio, .. } = cli.command else {
+            panic!("expected image subcommand");
+        };
+        assert_eq!(aspect_ratio, Some(AspectRatio::Square));
+    }
+
+    #[test]
+    fn test_default_output_path_follows_mime_type() {
+        assert_eq!(
+            default_output_path("image/jpeg"),
+            PathBuf::from("output.jpg")
+        );
+        assert_eq!(
+            default_output_path("image/png"),
+            PathBuf::from("output.png")
+        );
+        assert_eq!(
+            default_output_path("image/webp"),
+            PathBuf::from("output.webp")
+        );
+        assert_eq!(
+            default_output_path("application/octet-stream"),
+            PathBuf::from("output.bin")
+        );
+    }
+
+    #[test]
+    fn test_cli_output_is_absent_unless_passed() {
+        let cli = Cli::try_parse_from(["nano-banana-cli", "image", "a cat"]).unwrap();
+        let Commands::Image { output, .. } = cli.command else {
+            panic!("expected image subcommand");
+        };
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_extension_mismatch_warning() {
+        // The live-observed case: a Gemini JPEG written to a .png path.
+        let warning = extension_mismatch_warning(Path::new("/tmp/nb2.png"), "image/jpeg")
+            .expect("jpeg bytes in a .png must warn");
+        assert!(warning.contains("image/jpeg"), "{warning}");
+        assert!(warning.contains(".jpg"), "{warning}");
+
+        assert!(extension_mismatch_warning(Path::new("a.jpg"), "image/jpeg").is_none());
+        assert!(extension_mismatch_warning(Path::new("a.JPEG"), "image/jpeg").is_none());
+        assert!(extension_mismatch_warning(Path::new("a.png"), "image/png").is_none());
+        // No extension or an unknown mime type: nothing to compare against.
+        assert!(extension_mismatch_warning(Path::new("image"), "image/jpeg").is_none());
+        assert!(extension_mismatch_warning(Path::new("a.png"), "image/heic").is_none());
+    }
+
+    /// The error `GoogleImageProvider::parse_response` gives for `json`.
+    fn google_image_parse_error(json: &str) -> String {
+        let provider = GoogleImageProvider { aspect_ratio: None };
+        // `let else` rather than unwrap_err: GeneratedImage holds raw image
+        // bytes and deliberately has no Debug impl.
+        let Err(err) = provider.parse_response(serde_json::from_str(json).unwrap()) else {
+            panic!("expected parse_response to fail for {json}");
+        };
+        err.to_string()
+    }
+
+    #[test]
+    fn test_safety_blocked_candidate_deserializes_and_reports_reason() {
+        // A blocked answer: a candidate with a finishReason and no content.
+        let json = r#"{"candidates": [{"finishReason": "SAFETY", "index": 0}]}"#;
+        let response: Response = serde_json::from_str(json).unwrap();
+
+        let err = extract_text(&response).unwrap_err().to_string();
+        assert!(err.contains("SAFETY"), "{err}");
+
+        let err = google_image_parse_error(json);
+        assert!(err.contains("No image data"), "{err}");
+        assert!(err.contains("finish reason: SAFETY"), "{err}");
+    }
+
+    #[test]
+    fn test_blocked_prompt_deserializes_and_reports_block_reason() {
+        // A blocked prompt: no candidates key at all, only promptFeedback.
+        let json = r#"{"promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}}"#;
+        let response: Response = serde_json::from_str(json).unwrap();
+
+        let err = extract_text(&response).unwrap_err().to_string();
+        assert!(err.contains("no candidates"), "{err}");
+        assert!(err.contains("prompt blocked: PROHIBITED_CONTENT"), "{err}");
+
+        let err = google_image_parse_error(json);
+        assert!(err.contains("prompt blocked: PROHIBITED_CONTENT"), "{err}");
     }
 
     #[test]
